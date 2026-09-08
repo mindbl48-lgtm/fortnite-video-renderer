@@ -1,0 +1,125 @@
+name: Render Fortnite Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      clip1_url:
+        description: "URL clip 1"
+        required: true
+        type: string
+      clip1_duration:
+        description: "Durata clip 1"
+        required: true
+        default: "4"
+        type: string
+
+      clip2_url:
+        description: "URL clip 2"
+        required: true
+        type: string
+      clip2_duration:
+        description: "Durata clip 2"
+        required: true
+        default: "2"
+        type: string
+
+      clip3_url:
+        description: "URL clip 3"
+        required: true
+        type: string
+      clip3_duration:
+        description: "Durata clip 3"
+        required: true
+        default: "4"
+        type: string
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Download clips
+        env:
+          CLIP1_URL: ${{ inputs.clip1_url }}
+          CLIP2_URL: ${{ inputs.clip2_url }}
+          CLIP3_URL: ${{ inputs.clip3_url }}
+        run: |
+          curl -L "$CLIP1_URL" -o clip1.mp4
+          curl -L "$CLIP2_URL" -o clip2.mp4
+          curl -L "$CLIP3_URL" -o clip3.mp4
+
+      - name: Prepare clip 1
+        env:
+          DURATION: ${{ inputs.clip1_duration }}
+        run: |
+          ffmpeg -y \
+            -i clip1.mp4 \
+            -t "$DURATION" \
+            -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2" \
+            -r 30 \
+            -c:v libx264 \
+            -preset fast \
+            -crf 20 \
+            -c:a aac \
+            -ar 48000 \
+            -ac 2 \
+            prepared1.mp4
+
+      - name: Prepare clip 2
+        env:
+          DURATION: ${{ inputs.clip2_duration }}
+        run: |
+          ffmpeg -y \
+            -i clip2.mp4 \
+            -t "$DURATION" \
+            -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2" \
+            -r 30 \
+            -c:v libx264 \
+            -preset fast \
+            -crf 20 \
+            -c:a aac \
+            -ar 48000 \
+            -ac 2 \
+            prepared2.mp4
+
+      - name: Prepare clip 3
+        env:
+          DURATION: ${{ inputs.clip3_duration }}
+        run: |
+          ffmpeg -y \
+            -i clip3.mp4 \
+            -t "$DURATION" \
+            -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2" \
+            -r 30 \
+            -c:v libx264 \
+            -preset fast \
+            -crf 20 \
+            -c:a aac \
+            -ar 48000 \
+            -ac 2 \
+            prepared3.mp4
+
+      - name: Create concat list
+        run: |
+          printf "file 'prepared1.mp4'\nfile 'prepared2.mp4'\nfile 'prepared3.mp4'\n" > clips.txt
+
+      - name: Render final video
+        run: |
+          ffmpeg -y \
+            -f concat \
+            -safe 0 \
+            -i clips.txt \
+            -c copy \
+            final.mp4
+
+      - name: Upload final video
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: final.mp4
+          retention-days: 1
