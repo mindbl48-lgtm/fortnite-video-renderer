@@ -7,8 +7,13 @@ on:
         description: "URL clip 1"
         required: true
         type: string
+      clip1_trim_start:
+        description: "Trim start clip 1"
+        required: true
+        default: "0"
+        type: string
       clip1_duration:
-        description: "Durata clip 1"
+        description: "Durata finale clip 1"
         required: true
         default: "4"
         type: string
@@ -17,8 +22,13 @@ on:
         description: "URL clip 2"
         required: true
         type: string
+      clip2_trim_start:
+        description: "Trim start clip 2"
+        required: true
+        default: "0"
+        type: string
       clip2_duration:
-        description: "Durata clip 2"
+        description: "Durata finale clip 2"
         required: true
         default: "2"
         type: string
@@ -27,8 +37,13 @@ on:
         description: "URL clip 3"
         required: true
         type: string
+      clip3_trim_start:
+        description: "Trim start clip 3"
+        required: true
+        default: "0"
+        type: string
       clip3_duration:
-        description: "Durata clip 3"
+        description: "Durata finale clip 3"
         required: true
         default: "4"
         type: string
@@ -55,9 +70,11 @@ jobs:
 
       - name: Prepare clip 1
         env:
+          START: ${{ inputs.clip1_trim_start }}
           DURATION: ${{ inputs.clip1_duration }}
         run: |
           ffmpeg -y \
+            -ss "$START" \
             -i clip1.mp4 \
             -t "$DURATION" \
             -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2" \
@@ -72,9 +89,11 @@ jobs:
 
       - name: Prepare clip 2
         env:
+          START: ${{ inputs.clip2_trim_start }}
           DURATION: ${{ inputs.clip2_duration }}
         run: |
           ffmpeg -y \
+            -ss "$START" \
             -i clip2.mp4 \
             -t "$DURATION" \
             -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2" \
@@ -89,9 +108,11 @@ jobs:
 
       - name: Prepare clip 3
         env:
+          START: ${{ inputs.clip3_trim_start }}
           DURATION: ${{ inputs.clip3_duration }}
         run: |
           ffmpeg -y \
+            -ss "$START" \
             -i clip3.mp4 \
             -t "$DURATION" \
             -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2" \
