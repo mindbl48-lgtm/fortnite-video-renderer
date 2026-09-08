@@ -1,0 +1,310 @@
+name: Professional Video Render
+
+on:
+  workflow_dispatch:
+    inputs:
+      concept_id:
+        description: "Concept ID"
+        required: true
+        type: string
+
+      clips_json:
+        description: "Professional edit plan clips JSON"
+        required: true
+        type: string
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      CONCEPT_ID: ${{ inputs.concept_id }}
+      CLIPS_JSON: ${{ inputs.clips_json }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+
+      - name: Create render script
+        run: |
+          cat > render_professional.py <<'PYTHON'
+          import json
+          import os
+          import subprocess
+          import urllib.request
+          from pathlib import Path
+
+          clips = json.loads(os.environ["CLIPS_JSON"])
+
+          if not isinstance(clips, list) or not clips:
+              raise RuntimeError("clips_json non contiene clip valide")
+
+          clips = sorted(clips, key=lambda x: x["clip_order"])
+
+          FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+          def run(cmd):
+              print("RUN:", " ".join(cmd))
+              subprocess.run(cmd, check=True)
+
+          def escape_drawtext(text):
+              return (
+                  str(text)
+                  .replace("\\", "\\\\")
+                  .replace(":", "\\:")
+                  .replace("'", "\\'")
+                  .replace("%", "\\%")
+              )
+
+          def position_expression(position):
+              positions = {
+                  "top": ("(w-text_w)/2", "120"),
+                  "top-center": ("(w-text_w)/2", "120"),
+                  "center": ("(w-text_w)/2", "(h-text_h)/2"),
+                  "bottom": ("(w-text_w)/2", "h-text_h-260"),
+                  "bottom-center": ("(w-text_w)/2", "h-text_h-260"),
+                  "centro": ("(w-text_w)/2", "(h-text_h)/2"),
+                  "alto": ("(w-text_w)/2", "120"),
+                  "centro-basso": ("(w-text_w)/2", "h-text_h-260"),
+              }
+
+              return positions.get(
+                  position,
+                  ("(w-text_w)/2", "h-text_h-260")
+              )
+
+          prepared_files = []
+
+          for index, clip in enumerate(clips, start=1):
+              source_url = clip["source_file_url"]
+
+              source_file = f"source_{index}.mp4"
+              output_file = f"prepared_{index}.mp4"
+
+              print(f"Downloading clip {index}: {source_url}")
+              urllib.request.urlretrieve(source_url, source_file)
+
+              trim_start = float(clip.get("trim_start_seconds", 0))
+              trim_end = float(clip.get("trim_end_seconds", 0))
+              source_duration = trim_end - trim_start
+
+              if source_duration <= 0:
+                  raise RuntimeError(
+                      f"Durata sorgente non valida nella clip {index}"
+                  )
+
+              speed = float(clip.get("speed", 1.0))
+
+              if speed <= 0:
+                  raise RuntimeError(
+                      f"Speed non valida nella clip {index}"
+                  )
+
+              filters = []
+
+              # Base vertical format.
+              filters.append(
+                  "scale=1080:1920:force_original_aspect_ratio=decrease"
+              )
+              filters.append(
+                  "pad=1080:1920:(ow-iw)/2:(oh-ih)/2"
+              )
+              filters.append("setsar=1")
+
+              # Constant speed.
+              if abs(speed - 1.0) > 0.001:
+                  filters.append(f"setpts=PTS/{speed}")
+
+              final_duration = source_duration / speed
+
+              # Zoom.
+              zoom = clip.get("zoom") or {}
+
+              if zoom.get("enabled"):
+                  start_scale = float(zoom.get("start_scale", 1.0))
+                  end_scale = float(zoom.get("end_scale", 1.0))
+
+                  # Controlled zoompan over the full clip.
+                  zoom_delta = max(0.0, end_scale - start_scale)
+
+                  if zoom_delta > 0:
+                      frames = max(1, round(final_duration * 30))
+                      increment = zoom_delta / frames
+
+                      filters.append(
+                          "zoompan="
+                          f"z='min({end_scale},zoom+{increment})':"
+                          "x='iw/2-(iw/zoom/2)':"
+                          "y='ih/2-(ih/zoom/2)':"
+                          f"d={frames}:"
+                          "s=1080x1920:"
+                          "fps=30"
+                      )
+
+              effects = clip.get("effects") or []
+
+              for effect in effects:
+                  effect_type = effect.get("type", "none")
+
+                  start = float(effect.get("start_seconds", 0))
+                  end = float(effect.get("end_seconds", start))
+
+                  if effect_type == "impact_flash":
+                      # Brief white brightness flash.
+                      filters.append(
+                          "eq="
+                          "brightness=0.30:"
+                          f"enable='between(t,{start},{end})'"
+                      )
+
+                  elif effect_type == "subtle_shake":
+                      # Slight animated crop movement.
+                      filters.append(
+                          "scale=1100:1956,"
+                          "crop=1080:1920:"
+                          f"x='10+8*sin(40*t)*between(t,{start},{end})':"
+                          f"y='18+8*cos(35*t)*between(t,{start},{end})'"
+                      )
+
+              # Text overlays.
+              overlays = clip.get("text_overlays") or []
+
+              for overlay in overlays:
+                  text = str(overlay.get("text", "")).strip()
+
+                  if not text:
+                      continue
+
+                  start = float(overlay.get("start_seconds", 0))
+                  end = float(
+                      overlay.get(
+                          "end_seconds",
+                          final_duration
+                      )
+                  )
+
+                  position = overlay.get(
+                      "position",
+                      "bottom-center"
+                  )
+
+                  x, y = position_expression(position)
+
+                  escaped_text = escape_drawtext(text)
+
+                  filters.append(
+                      "drawtext="
+                      f"fontfile='{FONT}':"
+                      f"text='{escaped_text}':"
+                      "fontsize=64:"
+                      "fontcolor=white:"
+                      "borderw=5:"
+                      "bordercolor=black:"
+                      f"x='{x}':"
+                      f"y='{y}':"
+                      f"enable='between(t,{start},{end})'"
+                  )
+
+              filter_chain = ",".join(filters)
+
+              cmd = [
+                  "ffmpeg",
+                  "-y",
+                  "-ss",
+                  str(trim_start),
+                  "-i",
+                  source_file,
+                  "-t",
+                  str(source_duration),
+                  "-vf",
+                  filter_chain,
+                  "-r",
+                  "30",
+                  "-c:v",
+                  "libx264",
+                  "-preset",
+                  "fast",
+                  "-crf",
+                  "20",
+                  "-pix_fmt",
+                  "yuv420p",
+                  "-an",
+                  output_file,
+              ]
+
+              run(cmd)
+
+              prepared_files.append(output_file)
+
+          # Concatenation manifest.
+          with open("concat.txt", "w", encoding="utf-8") as f:
+              for filename in prepared_files:
+                  f.write(f"file '{Path(filename).resolve()}'\n")
+
+          run([
+              "ffmpeg",
+              "-y",
+              "-f",
+              "concat",
+              "-safe",
+              "0",
+              "-i",
+              "concat.txt",
+              "-c",
+              "copy",
+              "final.mp4",
+          ])
+
+          print("Professional render completed.")
+          PYTHON
+
+      - name: Render professional video
+        run: |
+          python3 render_professional.py
+
+      - name: Verify final video
+        run: |
+          ffprobe \
+            -v error \
+            -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 \
+            final.mp4
+
+      - name: Upload professional video to Supabase
+        run: |
+          STORAGE_PATH="content-clips/professional-final-videos/concept-${CONCEPT_ID}.mp4"
+
+          curl --fail --show-error --silent \
+            -X POST \
+            "${SUPABASE_URL}/storage/v1/object/${STORAGE_PATH}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Content-Type: video/mp4" \
+            -H "x-upsert: true" \
+            --data-binary "@final.mp4"
+
+          PUBLIC_URL="${SUPABASE_URL}/storage/v1/object/public/${STORAGE_PATH}"
+
+          echo "PUBLIC_URL=${PUBLIC_URL}" >> "$GITHUB_ENV"
+
+      - name: Add render URL to summary
+        run: |
+          echo "## Professional Render" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Concept: ${CONCEPT_ID}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "${PUBLIC_URL}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: professional-video-${{ inputs.concept_id }}
+          path: final.mp4
+          retention-days: 1
