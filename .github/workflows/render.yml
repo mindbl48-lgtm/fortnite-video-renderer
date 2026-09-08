@@ -3,6 +3,11 @@ name: Render Fortnite Video
 on:
   workflow_dispatch:
     inputs:
+      concept_id:
+        description: "Concept ID"
+        required: true
+        type: string
+
       clip1_url:
         description: "URL clip 1"
         required: true
@@ -138,7 +143,30 @@ jobs:
             -c copy \
             final.mp4
 
-      - name: Upload final video
+      - name: Upload final video to Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          CONCEPT_ID: ${{ inputs.concept_id }}
+        run: |
+          FILE_PATH="final-videos/concept-${CONCEPT_ID}.mp4"
+
+          curl --fail-with-body \
+            -X POST \
+            "${SUPABASE_URL}/storage/v1/object/content-clips/${FILE_PATH}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Content-Type: video/mp4" \
+            -H "x-upsert: true" \
+            --data-binary "@final.mp4"
+
+          FINAL_URL="${SUPABASE_URL}/storage/v1/object/public/content-clips/${FILE_PATH}"
+
+          echo "FINAL_VIDEO_URL=${FINAL_URL}" >> "$GITHUB_ENV"
+          echo "### Final video" >> "$GITHUB_STEP_SUMMARY"
+          echo "${FINAL_URL}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload GitHub artifact backup
         uses: actions/upload-artifact@v4
         with:
           name: final-video
