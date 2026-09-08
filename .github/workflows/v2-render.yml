@@ -1,0 +1,603 @@
+name: V2 Timeline Renderer
+
+on:
+  workflow_dispatch:
+    inputs:
+      timeline_json:
+        description: "Validated V2 timeline JSON"
+        required: true
+        type: string
+
+      video_idea:
+        description: "Video idea"
+        required: false
+        default: ""
+        type: string
+
+      voice_over_script:
+        description: "Voice-over script"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg python3 fonts-dejavu-core
+
+      - name: Prepare workspace
+        run: |
+          mkdir -p work/raw
+          mkdir -p work/segments
+          mkdir -p work/text
+          mkdir -p output
+
+      - name: Render validated timeline
+        env:
+          TIMELINE_JSON: ${{ inputs.timeline_json }}
+          VIDEO_IDEA: ${{ inputs.video_idea }}
+          VOICE_OVER_SCRIPT: ${{ inputs.voice_over_script }}
+        run: |
+          cat > /tmp/render_v2.py <<'PY'
+          import json
+          import os
+          import subprocess
+          import urllib.request
+          from pathlib import Path
+
+          TIMELINE_RAW = os.environ["TIMELINE_JSON"]
+          timeline = json.loads(TIMELINE_RAW)
+
+          if not isinstance(timeline, list) or not timeline:
+              raise RuntimeError("timeline_json vuoto o non valido")
+
+          ROOT = Path.cwd()
+          RAW_DIR = ROOT / "work" / "raw"
+          SEG_DIR = ROOT / "work" / "segments"
+          TEXT_DIR = ROOT / "work" / "text"
+          OUT_DIR = ROOT / "output"
+
+          FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+          for d in [RAW_DIR, SEG_DIR, TEXT_DIR, OUT_DIR]:
+              d.mkdir(parents=True, exist_ok=True)
+
+          ALLOWED_SPEEDS = {1.0, 1.1, 1.2}
+          ALLOWED_SFX = {
+              "splash",
+              "click",
+              "whoosh",
+              "ui_pop",
+              "impact",
+              "bass_hit",
+              "riser",
+          }
+
+          def run(cmd):
+              print("\nCOMMAND:")
+              print(" ".join(str(x) for x in cmd))
+              subprocess.run(cmd, check=True)
+
+          def ffprobe_duration(path):
+              result = subprocess.run(
+                  [
+                      "ffprobe",
+                      "-v", "error",
+                      "-show_entries", "format=duration",
+                      "-of", "default=noprint_wrappers=1:nokey=1",
+                      str(path),
+                  ],
+                  capture_output=True,
+                  text=True,
+                  check=True,
+              )
+              return float(result.stdout.strip())
+
+          # -------------------------------------------------
+          # DOWNLOAD UNIQUE RAW CLIPS
+          # -------------------------------------------------
+
+          source_files = {}
+
+          for segment in timeline:
+              clip_index = int(segment["clip_index"])
+              url = str(segment["source_url"]).strip()
+
+              if not url.startswith("http"):
+                  raise RuntimeError(
+                      f"URL non valido per clip_index {clip_index}: {url}"
+                  )
+
+              if clip_index in source_files:
+                  continue
+
+              target = RAW_DIR / f"clip_{clip_index}.mp4"
+
+              print(f"Downloading clip {clip_index}")
+              urllib.request.urlretrieve(url, target)
+
+              if not target.exists() or target.stat().st_size == 0:
+                  raise RuntimeError(
+                      f"Download fallito per clip {clip_index}"
+                  )
+
+              source_files[clip_index] = target
+
+          # -------------------------------------------------
+          # HELPERS
+          # -------------------------------------------------
+
+          def zoom_factor(edit):
+              crop = edit.get("crop", "none")
+              zoom = edit.get("zoom", "none")
+
+              factors = [1.0]
+
+              if crop == "slight":
+                  factors.append(1.05)
+              elif crop == "medium":
+                  factors.append(1.10)
+
+              if zoom == "micro":
+                  factors.append(1.05)
+              elif zoom == "punch_in":
+                  factors.append(1.15)
+
+              return max(factors)
+
+          def overlay_y(position):
+              if position == "top":
+                  return "120"
+
+              if position == "center":
+                  return "(h-text_h)/2"
+
+              return "h-text_h-230"
+
+          def write_text_file(path, text):
+              path.write_text(
+                  str(text or ""),
+                  encoding="utf-8"
+              )
+
+          def add_drawtext(
+              filters,
+              text_file,
+              position,
+              start,
+              end,
+              fontsize=58
+          ):
+              if end <= start:
+                  return
+
+              filters.append(
+                  "drawtext="
+                  f"fontfile='{FONT}':"
+                  f"textfile='{text_file}':"
+                  "fontcolor=white:"
+                  f"fontsize={fontsize}:"
+                  "borderw=5:"
+                  "bordercolor=black:"
+                  "x=(w-text_w)/2:"
+                  f"y={overlay_y(position)}:"
+                  f"enable='between(t,{start:.3f},{end:.3f})'"
+              )
+
+          # -------------------------------------------------
+          # RENDER EACH VALIDATED SEGMENT
+          # -------------------------------------------------
+
+          rendered_segments = []
+
+          ordered = sorted(
+              timeline,
+              key=lambda x: int(x.get("order", 0))
+          )
+
+          for seq, segment in enumerate(ordered, start=1):
+
+              clip_index = int(segment["clip_index"])
+
+              source = source_files.get(clip_index)
+
+              if source is None:
+                  raise RuntimeError(
+                      f"Sorgente non trovata: clip {clip_index}"
+                  )
+
+              start = float(segment["start_seconds"])
+              end = float(segment["end_seconds"])
+
+              if end <= start:
+                  raise RuntimeError(
+                      f"Timestamp non validi segmento {seq}"
+                  )
+
+              source_duration = end - start
+
+              edit = segment.get("edit_action") or {}
+
+              speed = float(edit.get("speed", 1.0))
+
+              if speed not in ALLOWED_SPEEDS:
+                  raise RuntimeError(
+                      f"Speed non consentita nel segmento {seq}: {speed}"
+                  )
+
+              final_duration = source_duration / speed
+
+              output = SEG_DIR / f"segment_{seq:03d}.mp4"
+
+              # ---------------------------------------------
+              # VIDEO FILTER
+              # ---------------------------------------------
+
+              vf = [
+                  "scale=720:1280:force_original_aspect_ratio=increase",
+                  "crop=720:1280",
+                  "setsar=1",
+                  "fps=30",
+                  f"setpts=PTS/{speed}",
+              ]
+
+              factor = zoom_factor(edit)
+
+              if factor > 1.001:
+                  zw = int(round(720 * factor / 2) * 2)
+                  zh = int(round(1280 * factor / 2) * 2)
+
+                  vf.extend([
+                      f"scale={zw}:{zh}",
+                      "crop=720:1280:(iw-720)/2:(ih-1280)/2",
+                  ])
+
+              effect = edit.get("effect", "none")
+
+              if effect == "impact_flash":
+                  vf.append(
+                      "drawbox="
+                      "x=0:y=0:w=iw:h=ih:"
+                      "color=white@0.32:"
+                      "t=fill:"
+                      "enable='between(t,0,0.07)'"
+                  )
+
+              # ---------------------------------------------
+              # TEXT OVERLAY
+              # ---------------------------------------------
+
+              overlay = segment.get("text_overlay") or {}
+              overlay_text = str(
+                  overlay.get("text") or ""
+              ).strip()
+
+              if overlay_text:
+                  overlay_file = (
+                      TEXT_DIR / f"overlay_{seq:03d}.txt"
+                  )
+
+                  write_text_file(
+                      overlay_file,
+                      overlay_text
+                  )
+
+                  o_start = float(
+                      overlay.get(
+                          "start_seconds_local",
+                          0
+                      ) or 0
+                  )
+
+                  o_end = float(
+                      overlay.get(
+                          "end_seconds_local",
+                          final_duration
+                      ) or 0
+                  )
+
+                  o_start = max(
+                      0,
+                      min(o_start, final_duration)
+                  )
+
+                  o_end = max(
+                      o_start,
+                      min(o_end, final_duration)
+                  )
+
+                  add_drawtext(
+                      vf,
+                      overlay_file,
+                      overlay.get(
+                          "position",
+                          "center"
+                      ),
+                      o_start,
+                      o_end,
+                      fontsize=54
+                  )
+
+              # ---------------------------------------------
+              # SUBTITLE
+              # ---------------------------------------------
+
+              subtitle = str(
+                  segment.get("subtitle_text") or ""
+              ).strip()
+
+              if subtitle:
+                  subtitle_file = (
+                      TEXT_DIR / f"subtitle_{seq:03d}.txt"
+                  )
+
+                  write_text_file(
+                      subtitle_file,
+                      subtitle
+                  )
+
+                  vf.append(
+                      "drawtext="
+                      f"fontfile='{FONT}':"
+                      f"textfile='{subtitle_file}':"
+                      "fontcolor=white:"
+                      "fontsize=64:"
+                      "borderw=6:"
+                      "bordercolor=black:"
+                      "x=(w-text_w)/2:"
+                      "y=h-text_h-120:"
+                      f"enable='between(t,0,{final_duration:.3f})'"
+                  )
+
+              video_filter = ",".join(vf)
+
+              # ---------------------------------------------
+              # SFX INPUTS
+              # ---------------------------------------------
+
+              cmd = [
+                  "ffmpeg",
+                  "-y",
+                  "-ss", f"{start:.3f}",
+                  "-t", f"{source_duration:.3f}",
+                  "-i", str(source),
+              ]
+
+              valid_sfx = []
+
+              for fx in segment.get("sfx") or []:
+                  fx_type = str(fx.get("type") or "")
+
+                  if fx_type not in ALLOWED_SFX:
+                      continue
+
+                  fx_path = (
+                      ROOT /
+                      "assets" /
+                      "sfx" /
+                      f"{fx_type}.wav"
+                  )
+
+                  if not fx_path.exists():
+                      print(
+                          f"WARNING: SFX non trovato: {fx_path}"
+                      )
+                      continue
+
+                  at = float(
+                      fx.get("at_seconds_local", 0) or 0
+                  )
+
+                  if at < 0 or at > final_duration:
+                      print(
+                          f"WARNING: timing SFX fuori range: {fx_type}"
+                      )
+                      continue
+
+                  valid_sfx.append(
+                      (fx_path, at)
+                  )
+
+                  cmd.extend([
+                      "-i",
+                      str(fx_path)
+                  ])
+
+              # ---------------------------------------------
+              # AUDIO FILTER
+              # ---------------------------------------------
+
+              filter_complex = [
+                  f"[0:v]{video_filter}[vout]",
+                  f"[0:a]atempo={speed},"
+                  "aresample=48000,"
+                  "aformat=channel_layouts=stereo,"
+                  "volume=0.90[game]"
+              ]
+
+              audio_labels = ["[game]"]
+
+              for fx_index, (_, at) in enumerate(
+                  valid_sfx,
+                  start=1
+              ):
+                  delay_ms = int(round(at * 1000))
+
+                  label = f"sfx{fx_index}"
+
+                  filter_complex.append(
+                      f"[{fx_index}:a]"
+                      "aresample=48000,"
+                      "aformat=channel_layouts=stereo,"
+                      f"adelay={delay_ms}|{delay_ms},"
+                      f"atrim=0:{final_duration:.3f},"
+                      f"volume=0.90[{label}]"
+                  )
+
+                  audio_labels.append(
+                      f"[{label}]"
+                  )
+
+              if len(audio_labels) == 1:
+                  filter_complex.append(
+                      "[game]anull[aout]"
+                  )
+              else:
+                  joined = "".join(audio_labels)
+
+                  filter_complex.append(
+                      f"{joined}"
+                      f"amix=inputs={len(audio_labels)}:"
+                      "duration=first:"
+                      "dropout_transition=0:"
+                      "normalize=0[aout]"
+                  )
+
+              cmd.extend([
+                  "-filter_complex",
+                  ";".join(filter_complex),
+
+                  "-map", "[vout]",
+                  "-map", "[aout]",
+
+                  "-c:v", "libx264",
+                  "-preset", "medium",
+                  "-crf", "18",
+                  "-pix_fmt", "yuv420p",
+
+                  "-c:a", "aac",
+                  "-b:a", "192k",
+                  "-ar", "48000",
+                  "-ac", "2",
+
+                  "-movflags", "+faststart",
+
+                  str(output)
+              ])
+
+              run(cmd)
+
+              real_duration = ffprobe_duration(output)
+
+              print(
+                  f"Segment {seq}: "
+                  f"{start:.3f}-{end:.3f} "
+                  f"speed={speed} "
+                  f"expected={final_duration:.3f}s "
+                  f"rendered={real_duration:.3f}s"
+              )
+
+              rendered_segments.append(output)
+
+          # -------------------------------------------------
+          # CONCAT
+          # -------------------------------------------------
+
+          concat_file = ROOT / "work" / "concat.txt"
+
+          with concat_file.open(
+              "w",
+              encoding="utf-8"
+          ) as f:
+              for segment_file in rendered_segments:
+                  safe = str(
+                      segment_file.resolve()
+                  ).replace("'", "'\\''")
+
+                  f.write(
+                      f"file '{safe}'\n"
+                  )
+
+          intermediate = (
+              OUT_DIR / "final_v2_concat.mp4"
+          )
+
+          run([
+              "ffmpeg",
+              "-y",
+              "-f", "concat",
+              "-safe", "0",
+              "-i", str(concat_file),
+              "-c", "copy",
+              "-movflags", "+faststart",
+              str(intermediate),
+          ])
+
+          # Final normalization encode.
+          final_output = (
+              OUT_DIR / "final_v2.mp4"
+          )
+
+          run([
+              "ffmpeg",
+              "-y",
+              "-i", str(intermediate),
+
+              "-vf",
+              "scale=720:1280:"
+              "force_original_aspect_ratio=increase,"
+              "crop=720:1280,"
+              "fps=30,"
+              "setsar=1",
+
+              "-c:v", "libx264",
+              "-preset", "medium",
+              "-crf", "18",
+              "-pix_fmt", "yuv420p",
+
+              "-c:a", "aac",
+              "-b:a", "192k",
+              "-ar", "48000",
+              "-ac", "2",
+
+              "-movflags", "+faststart",
+
+              str(final_output),
+          ])
+
+          duration = ffprobe_duration(
+              final_output
+          )
+
+          print("")
+          print("==============================")
+          print("V2 RENDER COMPLETE")
+          print("==============================")
+          print(f"Output: {final_output}")
+          print(f"Duration: {duration:.3f}s")
+          print(f"Segments: {len(rendered_segments)}")
+          print(f"Video idea: {os.environ.get('VIDEO_IDEA', '')}")
+          print("==============================")
+          PY
+
+          python3 /tmp/render_v2.py
+
+      - name: Show final video information
+        run: |
+          ffprobe \
+            -v error \
+            -show_entries \
+            format=duration,size,bit_rate \
+            -show_entries \
+            stream=index,codec_name,width,height,r_frame_rate \
+            -of json \
+            output/final_v2.mp4
+
+      - name: Upload V2 render artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-v2-render
+          path: output/final_v2.mp4
+          if-no-files-found: error
+          retention-days: 7
